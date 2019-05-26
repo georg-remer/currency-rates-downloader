@@ -1,0 +1,5 @@
+*.py[co]
+*.code-workspace
+env/
+__pycache__
+settings.py

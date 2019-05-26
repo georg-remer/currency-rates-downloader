@@ -1,0 +1,749 @@
+--
+-- PostgreSQL database dump
+--
+
+-- Dumped from database version 11.0
+-- Dumped by pg_dump version 11.2
+
+-- Started on 2019-05-25 21:00:34 EET
+
+SET statement_timeout = 0;
+SET lock_timeout = 0;
+SET idle_in_transaction_session_timeout = 0;
+SET client_encoding = 'UTF8';
+SET standard_conforming_strings = on;
+SELECT pg_catalog.set_config('search_path', '', false);
+SET check_function_bodies = false;
+SET client_min_messages = warning;
+SET row_security = off;
+
+--
+-- TOC entry 7 (class 2615 OID 27632)
+-- Name: currency; Type: SCHEMA; Schema: -; Owner: -
+--
+
+CREATE SCHEMA currency;
+
+
+--
+-- TOC entry 225 (class 1255 OID 27669)
+-- Name: f_crncy_downldr_return_crncs(integer, boolean, date); Type: FUNCTION; Schema: currency; Owner: -
+--
+
+CREATE FUNCTION currency.f_crncy_downldr_return_crncs(var_in_crncy_id integer, var_check_min_threshold boolean DEFAULT true, var_min_threshold date DEFAULT '2019-05-01'::date) RETURNS TABLE(currency_identificator text, latest_date date)
+    LANGUAGE plpgsql
+    AS $$
+DECLARE
+	/*
+	@var_min_threshold date - date to download currency rates from.
+	Is used if @var_check_min_threshold is set to 'true'.
+	*/
+BEGIN
+	CREATE LOCAL TEMP TABLE t_result(
+		currency_identificator text,
+		latest_date date)
+	ON COMMIT DROP;
+
+	/* 2 - RUB in t_ref_currency, Central Bank of Russia */
+	IF var_in_crncy_id = 2 THEN
+		INSERT INTO t_result
+		WITH cte_cbr AS (
+			SELECT
+				id_ref_currency_original,
+				max(exchange_rate_date) AS latest_download_cbr
+			FROM currency.t_currency_rates
+			WHERE id_ref_currency_conversion = 2
+				AND dttmcl IS NULL
+			GROUP BY id_ref_currency_original
+		)
+		SELECT currency_identificator_cbr, latest_download_cbr
+		FROM currency.t_ref_currency
+		LEFT JOIN cte_cbr ON t_ref_currency.id_ref_currency = cte_cbr.id_ref_currency_original
+		WHERE download_from_cbr IS true
+			AND currency_identificator_cbr IS NOT NULL;
+	
+	/* 8 - UAH in t_ref_currency, National Bank of Ukraine */
+	ELSIF var_in_crncy_id = 8 THEN
+		INSERT INTO t_result
+		WITH cte_nbu AS (
+			SELECT
+				id_ref_currency_original,
+				max(exchange_rate_date) AS latest_download_nbu
+			FROM currency.t_currency_rates
+			WHERE id_ref_currency_conversion = 8
+				AND dttmcl IS NULL
+			GROUP BY id_ref_currency_original
+		)
+		SELECT currency_num_code, latest_download_nbu
+		FROM currency.t_ref_currency
+		LEFT JOIN cte_nbu ON t_ref_currency.id_ref_currency = cte_nbu.id_ref_currency_original
+		WHERE download_from_nbu IS true;
+	END IF;
+	
+	/* Excluding unnecessary date range */
+	IF var_check_min_threshold THEN
+		RETURN QUERY
+		SELECT
+			t_result.currency_identificator,
+			COALESCE(t_result.latest_date, var_min_threshold)
+		FROM t_result
+		WHERE t_result.latest_date >= var_min_threshold
+			OR t_result.latest_date IS NULL;
+	ELSE
+		RETURN QUERY
+		SELECT
+			t_result.currency_identificator,
+			COALESCE(t_result.latest_date, var_min_threshold)
+		FROM t_result;
+	END IF;
+	
+END;
+$$;
+
+
+--
+-- TOC entry 3203 (class 0 OID 0)
+-- Dependencies: 225
+-- Name: FUNCTION f_crncy_downldr_return_crncs(var_in_crncy_id integer, var_check_min_threshold boolean, var_min_threshold date); Type: COMMENT; Schema: currency; Owner: -
+--
+
+COMMENT ON FUNCTION currency.f_crncy_downldr_return_crncs(var_in_crncy_id integer, var_check_min_threshold boolean, var_min_threshold date) IS 'Returns list of currencies and latest dates when currency rates for them where downloaded.';
+
+
+--
+-- TOC entry 227 (class 1255 OID 27670)
+-- Name: f_crncy_downldr_return_url(integer, boolean, date, date); Type: FUNCTION; Schema: currency; Owner: -
+--
+
+CREATE FUNCTION currency.f_crncy_downldr_return_url(var_in_crncy_id integer, var_check_min_threshold boolean DEFAULT true, var_min_threshold date DEFAULT '2019-05-01'::date, var_max_date date DEFAULT CURRENT_DATE) RETURNS TABLE(date_to_download date, url text)
+    LANGUAGE plpgsql
+    AS $$
+DECLARE
+	/*
+	@var_min_threshold date - date to download currency rates from.
+	Is used if @var_check_min_threshold is set to 'true'.
+	
+	@var_max_date (default - as returned by current_date) - download exchange rates
+	up to this date. Can be defined manually, e.g. '11-30-2018'::date.
+	*/
+	var_min_date date;	-- Date to download rates from
+	var_cbr_url text := 'http://www.cbr.ru/scripts/XML_daily.asp?date_req=';	-- URL basis for Central Bank of Russia API
+	var_nbu_url text := 'https://bank.gov.ua/NBUStatService/v1/statdirectory/exchange?date=';	-- URL basis for National Bank of Ukraine API
+BEGIN
+	CREATE LOCAL TEMP TABLE t_result(
+		date_to_download date,
+		url text)
+	ON COMMIT DROP;
+	
+	/* 2 - RUB in t_ref_currency, return list of URLs for Central Bank of Russia API */
+	IF var_in_crncy_id = 2 THEN
+	
+		/* Define date to download rates from */
+		WITH cte AS (
+			SELECT
+				id_ref_currency_original,
+				max(exchange_rate_date) AS latest_download
+			FROM currency.t_currency_rates
+			WHERE id_ref_currency_conversion = var_in_crncy_id
+			GROUP BY id_ref_currency_original
+			ORDER BY latest_download DESC
+		)
+		SELECT
+			min(latest_download)
+		INTO
+			var_min_date
+		FROM cte
+		LEFT JOIN currency.t_ref_currency ON cte.id_ref_currency_original = t_ref_currency.id_ref_currency
+		WHERE download_from_cbr IS true
+			AND currency_identificator_cbr IS NOT NULL;
+	
+	/* 8 - UAH in t_ref_currency, return list of URLs for National Bank of Ukraine API */
+	ELSIF var_in_crncy_id = 8 THEN
+	
+		/* Define date to download rates from */
+		WITH cte AS (
+			SELECT
+				id_ref_currency_original,
+				max(exchange_rate_date) AS latest_download
+			FROM currency.t_currency_rates
+			WHERE id_ref_currency_conversion = var_in_crncy_id
+			GROUP BY id_ref_currency_original
+			ORDER BY latest_download DESC
+		)
+		SELECT
+			min(latest_download)
+		INTO
+			var_min_date
+		FROM cte
+		LEFT JOIN currency.t_ref_currency ON cte.id_ref_currency_original = t_ref_currency.id_ref_currency
+		WHERE download_from_nbu IS true;
+		
+	END IF;
+	
+	/* Excluding unnecessary date range */
+	IF var_check_min_threshold THEN
+		var_min_date := CASE
+							WHEN var_min_date < var_min_threshold OR var_min_date IS NULL
+							THEN var_min_threshold
+						ELSE var_min_date END;
+	END IF;
+
+	/* If minimun date is not defined */
+	IF var_min_date IS NULL THEN
+		var_min_date := var_max_date;
+	END IF;
+
+	LOOP
+		var_min_date := var_min_date + interval '1 day';
+		INSERT INTO t_result
+		SELECT var_min_date,
+			(CASE WHEN var_in_crncy_id = 2 THEN var_cbr_url ELSE var_nbu_url END) ||
+			(CASE WHEN var_in_crncy_id = 2 THEN to_char(var_min_date, 'DD/MM/YYYY') ELSE to_char(var_min_date, 'YYYYMMDD') END);
+
+		EXIT WHEN var_min_date >= var_max_date + interval '1 day';
+	END LOOP;
+	
+RETURN QUERY
+SELECT * FROM t_result;
+
+END;
+$$;
+
+
+--
+-- TOC entry 226 (class 1255 OID 27671)
+-- Name: f_crncy_downldr_save_rate(integer, text, date, integer, numeric); Type: FUNCTION; Schema: currency; Owner: -
+--
+
+CREATE FUNCTION currency.f_crncy_downldr_save_rate(var_in_crncy_id integer, var_in_identificator_currency text, var_in_crncy_date date, var_in_crncy_nominal integer, var_in_crncy_rate numeric) RETURNS boolean
+    LANGUAGE plpgsql
+    AS $$
+DECLARE
+	var_existing_entry integer;				-- Number of existing rows for specified date and currency
+	var_id_ref_currency_original integer;	-- Original currency ID
+	var_id_user integer := 0;				-- User ID
+BEGIN
+	var_id_ref_currency_original := (
+		SELECT id_ref_currency
+		FROM currency.t_ref_currency tc
+		WHERE (CASE
+					WHEN var_in_crncy_id = 2 THEN tc.currency_identificator_cbr
+					ELSE tc.currency_num_code::text
+				END) = var_in_identificator_currency
+	);
+	
+	/* Check if anything has already been downloaded for specified date and currency */
+	var_existing_entry := (
+		SELECT count(*)
+		FROM currency.t_currency_rates
+		WHERE id_ref_currency_conversion = var_in_crncy_id
+			AND exchange_rate_date = var_in_crncy_date
+			AND id_ref_currency_original = var_id_ref_currency_original
+	);
+	
+	/* If nothing was downloaded previously, save exchange rate */
+	IF var_existing_entry = 0 THEN
+		INSERT INTO currency.t_currency_rates(
+			id_user,
+			id_ref_currency_original,
+			exchange_rate_date,
+			nominal,
+			exchange_rate,
+			id_ref_currency_conversion
+		) VALUES(
+			var_id_user,
+			var_id_ref_currency_original,
+			var_in_crncy_date,
+			var_in_crncy_nominal,
+			var_in_crncy_rate,
+			var_in_crncy_id
+		);
+		
+		RETURN true;
+	ELSE
+		RETURN false;
+	END IF;
+END;
+$$;
+
+
+--
+-- TOC entry 3204 (class 0 OID 0)
+-- Dependencies: 226
+-- Name: FUNCTION f_crncy_downldr_save_rate(var_in_crncy_id integer, var_in_identificator_currency text, var_in_crncy_date date, var_in_crncy_nominal integer, var_in_crncy_rate numeric); Type: COMMENT; Schema: currency; Owner: -
+--
+
+COMMENT ON FUNCTION currency.f_crncy_downldr_save_rate(var_in_crncy_id integer, var_in_identificator_currency text, var_in_crncy_date date, var_in_crncy_nominal integer, var_in_crncy_rate numeric) IS 'Save exchange rate to database';
+
+
+SET default_with_oids = false;
+
+--
+-- TOC entry 210 (class 1259 OID 27635)
+-- Name: t_currency_rates; Type: TABLE; Schema: currency; Owner: -
+--
+
+CREATE TABLE currency.t_currency_rates (
+    id_currency_rates integer NOT NULL,
+    dttmcr timestamp with time zone DEFAULT now() NOT NULL,
+    dttmcl timestamp with time zone,
+    id_user integer NOT NULL,
+    id_ref_currency_original integer,
+    exchange_rate_date date,
+    nominal numeric,
+    exchange_rate numeric,
+    id_ref_currency_conversion integer
+);
+
+
+--
+-- TOC entry 3205 (class 0 OID 0)
+-- Dependencies: 210
+-- Name: TABLE t_currency_rates; Type: COMMENT; Schema: currency; Owner: -
+--
+
+COMMENT ON TABLE currency.t_currency_rates IS 'Downloaded exchange rates';
+
+
+--
+-- TOC entry 3206 (class 0 OID 0)
+-- Dependencies: 210
+-- Name: COLUMN t_currency_rates.id_currency_rates; Type: COMMENT; Schema: currency; Owner: -
+--
+
+COMMENT ON COLUMN currency.t_currency_rates.id_currency_rates IS 'ID';
+
+
+--
+-- TOC entry 3207 (class 0 OID 0)
+-- Dependencies: 210
+-- Name: COLUMN t_currency_rates.dttmcr; Type: COMMENT; Schema: currency; Owner: -
+--
+
+COMMENT ON COLUMN currency.t_currency_rates.dttmcr IS 'Date and time when row was created';
+
+
+--
+-- TOC entry 3208 (class 0 OID 0)
+-- Dependencies: 210
+-- Name: COLUMN t_currency_rates.dttmcl; Type: COMMENT; Schema: currency; Owner: -
+--
+
+COMMENT ON COLUMN currency.t_currency_rates.dttmcl IS 'Date and time when row was closed';
+
+
+--
+-- TOC entry 3209 (class 0 OID 0)
+-- Dependencies: 210
+-- Name: COLUMN t_currency_rates.id_user; Type: COMMENT; Schema: currency; Owner: -
+--
+
+COMMENT ON COLUMN currency.t_currency_rates.id_user IS 'User ID';
+
+
+--
+-- TOC entry 3210 (class 0 OID 0)
+-- Dependencies: 210
+-- Name: COLUMN t_currency_rates.id_ref_currency_original; Type: COMMENT; Schema: currency; Owner: -
+--
+
+COMMENT ON COLUMN currency.t_currency_rates.id_ref_currency_original IS 'FK - ID of foreign currency';
+
+
+--
+-- TOC entry 3211 (class 0 OID 0)
+-- Dependencies: 210
+-- Name: COLUMN t_currency_rates.exchange_rate_date; Type: COMMENT; Schema: currency; Owner: -
+--
+
+COMMENT ON COLUMN currency.t_currency_rates.exchange_rate_date IS 'Date of the exchange rate';
+
+
+--
+-- TOC entry 3212 (class 0 OID 0)
+-- Dependencies: 210
+-- Name: COLUMN t_currency_rates.nominal; Type: COMMENT; Schema: currency; Owner: -
+--
+
+COMMENT ON COLUMN currency.t_currency_rates.nominal IS 'Nominal of the rate';
+
+
+--
+-- TOC entry 3213 (class 0 OID 0)
+-- Dependencies: 210
+-- Name: COLUMN t_currency_rates.exchange_rate; Type: COMMENT; Schema: currency; Owner: -
+--
+
+COMMENT ON COLUMN currency.t_currency_rates.exchange_rate IS 'Exchange rate itself';
+
+
+--
+-- TOC entry 3214 (class 0 OID 0)
+-- Dependencies: 210
+-- Name: COLUMN t_currency_rates.id_ref_currency_conversion; Type: COMMENT; Schema: currency; Owner: -
+--
+
+COMMENT ON COLUMN currency.t_currency_rates.id_ref_currency_conversion IS 'FK - ID of domestic currency (2 for RUB or 8 for UAH)';
+
+
+--
+-- TOC entry 209 (class 1259 OID 27633)
+-- Name: t_currency_rates_id_currency_rates_seq; Type: SEQUENCE; Schema: currency; Owner: -
+--
+
+CREATE SEQUENCE currency.t_currency_rates_id_currency_rates_seq
+    AS integer
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- TOC entry 3215 (class 0 OID 0)
+-- Dependencies: 209
+-- Name: t_currency_rates_id_currency_rates_seq; Type: SEQUENCE OWNED BY; Schema: currency; Owner: -
+--
+
+ALTER SEQUENCE currency.t_currency_rates_id_currency_rates_seq OWNED BY currency.t_currency_rates.id_currency_rates;
+
+
+--
+-- TOC entry 212 (class 1259 OID 27647)
+-- Name: t_ref_currency; Type: TABLE; Schema: currency; Owner: -
+--
+
+CREATE TABLE currency.t_ref_currency (
+    id_ref_currency integer NOT NULL,
+    dttmcr timestamp with time zone DEFAULT now() NOT NULL,
+    dttmup timestamp with time zone,
+    dttmcl timestamp with time zone,
+    id_user integer NOT NULL,
+    currency_num_code integer,
+    currency_alfa_code text,
+    rus_name_currency text,
+    currency_identificator_cbr text,
+    download_from_cbr boolean,
+    download_from_nbu boolean
+);
+
+
+--
+-- TOC entry 3216 (class 0 OID 0)
+-- Dependencies: 212
+-- Name: TABLE t_ref_currency; Type: COMMENT; Schema: currency; Owner: -
+--
+
+COMMENT ON TABLE currency.t_ref_currency IS 'List of currencies';
+
+
+--
+-- TOC entry 3217 (class 0 OID 0)
+-- Dependencies: 212
+-- Name: COLUMN t_ref_currency.id_ref_currency; Type: COMMENT; Schema: currency; Owner: -
+--
+
+COMMENT ON COLUMN currency.t_ref_currency.id_ref_currency IS 'ID';
+
+
+--
+-- TOC entry 3218 (class 0 OID 0)
+-- Dependencies: 212
+-- Name: COLUMN t_ref_currency.dttmcr; Type: COMMENT; Schema: currency; Owner: -
+--
+
+COMMENT ON COLUMN currency.t_ref_currency.dttmcr IS 'Date and time when row was added';
+
+
+--
+-- TOC entry 3219 (class 0 OID 0)
+-- Dependencies: 212
+-- Name: COLUMN t_ref_currency.dttmup; Type: COMMENT; Schema: currency; Owner: -
+--
+
+COMMENT ON COLUMN currency.t_ref_currency.dttmup IS 'Date and time when row was updated';
+
+
+--
+-- TOC entry 3220 (class 0 OID 0)
+-- Dependencies: 212
+-- Name: COLUMN t_ref_currency.dttmcl; Type: COMMENT; Schema: currency; Owner: -
+--
+
+COMMENT ON COLUMN currency.t_ref_currency.dttmcl IS 'Date and time when row was closed';
+
+
+--
+-- TOC entry 3221 (class 0 OID 0)
+-- Dependencies: 212
+-- Name: COLUMN t_ref_currency.id_user; Type: COMMENT; Schema: currency; Owner: -
+--
+
+COMMENT ON COLUMN currency.t_ref_currency.id_user IS 'User ID';
+
+
+--
+-- TOC entry 3222 (class 0 OID 0)
+-- Dependencies: 212
+-- Name: COLUMN t_ref_currency.currency_num_code; Type: COMMENT; Schema: currency; Owner: -
+--
+
+COMMENT ON COLUMN currency.t_ref_currency.currency_num_code IS 'Numeric ISO code';
+
+
+--
+-- TOC entry 3223 (class 0 OID 0)
+-- Dependencies: 212
+-- Name: COLUMN t_ref_currency.currency_alfa_code; Type: COMMENT; Schema: currency; Owner: -
+--
+
+COMMENT ON COLUMN currency.t_ref_currency.currency_alfa_code IS 'Alfa-3 ISO code';
+
+
+--
+-- TOC entry 3224 (class 0 OID 0)
+-- Dependencies: 212
+-- Name: COLUMN t_ref_currency.rus_name_currency; Type: COMMENT; Schema: currency; Owner: -
+--
+
+COMMENT ON COLUMN currency.t_ref_currency.rus_name_currency IS 'Currency name in Russian';
+
+
+--
+-- TOC entry 3225 (class 0 OID 0)
+-- Dependencies: 212
+-- Name: COLUMN t_ref_currency.currency_identificator_cbr; Type: COMMENT; Schema: currency; Owner: -
+--
+
+COMMENT ON COLUMN currency.t_ref_currency.currency_identificator_cbr IS 'Currency identificator according to Central Bank of Russia';
+
+
+--
+-- TOC entry 3226 (class 0 OID 0)
+-- Dependencies: 212
+-- Name: COLUMN t_ref_currency.download_from_cbr; Type: COMMENT; Schema: currency; Owner: -
+--
+
+COMMENT ON COLUMN currency.t_ref_currency.download_from_cbr IS 'Whether to download rates for this currency from Central Bank of Russia';
+
+
+--
+-- TOC entry 3227 (class 0 OID 0)
+-- Dependencies: 212
+-- Name: COLUMN t_ref_currency.download_from_nbu; Type: COMMENT; Schema: currency; Owner: -
+--
+
+COMMENT ON COLUMN currency.t_ref_currency.download_from_nbu IS 'Whether to download rates for this currency from National Bank of Ukraine';
+
+
+--
+-- TOC entry 211 (class 1259 OID 27645)
+-- Name: t_ref_currency_id_ref_currency_seq; Type: SEQUENCE; Schema: currency; Owner: -
+--
+
+CREATE SEQUENCE currency.t_ref_currency_id_ref_currency_seq
+    AS integer
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- TOC entry 3228 (class 0 OID 0)
+-- Dependencies: 211
+-- Name: t_ref_currency_id_ref_currency_seq; Type: SEQUENCE OWNED BY; Schema: currency; Owner: -
+--
+
+ALTER SEQUENCE currency.t_ref_currency_id_ref_currency_seq OWNED BY currency.t_ref_currency.id_ref_currency;
+
+
+--
+-- TOC entry 3061 (class 2604 OID 27638)
+-- Name: t_currency_rates id_currency_rates; Type: DEFAULT; Schema: currency; Owner: -
+--
+
+ALTER TABLE ONLY currency.t_currency_rates ALTER COLUMN id_currency_rates SET DEFAULT nextval('currency.t_currency_rates_id_currency_rates_seq'::regclass);
+
+
+--
+-- TOC entry 3063 (class 2604 OID 27650)
+-- Name: t_ref_currency id_ref_currency; Type: DEFAULT; Schema: currency; Owner: -
+--
+
+ALTER TABLE ONLY currency.t_ref_currency ALTER COLUMN id_ref_currency SET DEFAULT nextval('currency.t_ref_currency_id_ref_currency_seq'::regclass);
+
+
+--
+-- TOC entry 3195 (class 0 OID 27635)
+-- Dependencies: 210
+-- Data for Name: t_currency_rates; Type: TABLE DATA; Schema: currency; Owner: -
+--
+
+
+
+--
+-- TOC entry 3197 (class 0 OID 27647)
+-- Dependencies: 212
+-- Data for Name: t_ref_currency; Type: TABLE DATA; Schema: currency; Owner: -
+--
+
+INSERT INTO currency.t_ref_currency (id_ref_currency, dttmcr, dttmup, dttmcl, id_user, currency_num_code, currency_alfa_code, rus_name_currency, currency_identificator_cbr, download_from_cbr, download_from_nbu) VALUES (49, '2015-03-17 14:28:37+02', NULL, NULL, 1, 32, 'ARS', 'Аргентинское песо', NULL, NULL, NULL);
+INSERT INTO currency.t_ref_currency (id_ref_currency, dttmcr, dttmup, dttmcl, id_user, currency_num_code, currency_alfa_code, rus_name_currency, currency_identificator_cbr, download_from_cbr, download_from_nbu) VALUES (73, '2016-10-20 09:12:10+02', '2016-10-20 09:12:24+02', NULL, 1, 48, 'BHD', 'Бахрейнский динар', NULL, NULL, NULL);
+INSERT INTO currency.t_ref_currency (id_ref_currency, dttmcr, dttmup, dttmcl, id_user, currency_num_code, currency_alfa_code, rus_name_currency, currency_identificator_cbr, download_from_cbr, download_from_nbu) VALUES (75, '2016-11-08 12:12:15+02', '2016-11-08 12:12:38+02', NULL, 1, 50, 'BDT', 'Бангладешская така', NULL, NULL, NULL);
+INSERT INTO currency.t_ref_currency (id_ref_currency, dttmcr, dttmup, dttmcl, id_user, currency_num_code, currency_alfa_code, rus_name_currency, currency_identificator_cbr, download_from_cbr, download_from_nbu) VALUES (74, '2016-10-24 10:08:15+02', '2016-10-24 10:08:46+02', NULL, 1, 104, 'MMK', 'Мьянманский кьят', NULL, NULL, NULL);
+INSERT INTO currency.t_ref_currency (id_ref_currency, dttmcr, dttmup, dttmcl, id_user, currency_num_code, currency_alfa_code, rus_name_currency, currency_identificator_cbr, download_from_cbr, download_from_nbu) VALUES (45, '2014-07-10 10:34:29+03', '2014-07-10 10:35:29+03', NULL, 1, 152, 'CLP', 'Чилийское песо', NULL, NULL, NULL);
+INSERT INTO currency.t_ref_currency (id_ref_currency, dttmcr, dttmup, dttmcl, id_user, currency_num_code, currency_alfa_code, rus_name_currency, currency_identificator_cbr, download_from_cbr, download_from_nbu) VALUES (48, '2015-03-04 11:20:25+02', NULL, NULL, 1, 170, 'COP', 'Колумбийское песо', NULL, NULL, NULL);
+INSERT INTO currency.t_ref_currency (id_ref_currency, dttmcr, dttmup, dttmcl, id_user, currency_num_code, currency_alfa_code, rus_name_currency, currency_identificator_cbr, download_from_cbr, download_from_nbu) VALUES (55, '2015-05-13 11:09:51+02', NULL, NULL, 1, 242, 'FJD', 'Доллар Фиджи', NULL, NULL, NULL);
+INSERT INTO currency.t_ref_currency (id_ref_currency, dttmcr, dttmup, dttmcl, id_user, currency_num_code, currency_alfa_code, rus_name_currency, currency_identificator_cbr, download_from_cbr, download_from_nbu) VALUES (66, '2016-03-15 15:15:42+02', '2016-03-15 15:16:39+02', NULL, 1, 320, 'GTQ', 'Гватемальский кетсаль', NULL, NULL, NULL);
+INSERT INTO currency.t_ref_currency (id_ref_currency, dttmcr, dttmup, dttmcl, id_user, currency_num_code, currency_alfa_code, rus_name_currency, currency_identificator_cbr, download_from_cbr, download_from_nbu) VALUES (60, '2015-08-21 09:40:56+02', '2015-08-21 09:41:36+02', NULL, 1, 352, 'ISK', 'Исландская крона', NULL, NULL, NULL);
+INSERT INTO currency.t_ref_currency (id_ref_currency, dttmcr, dttmup, dttmcl, id_user, currency_num_code, currency_alfa_code, rus_name_currency, currency_identificator_cbr, download_from_cbr, download_from_nbu) VALUES (72, '2016-09-30 09:12:13+02', '2016-09-30 09:12:50+02', NULL, 1, 404, 'KES', 'Кенийский шиллинг', NULL, NULL, NULL);
+INSERT INTO currency.t_ref_currency (id_ref_currency, dttmcr, dttmup, dttmcl, id_user, currency_num_code, currency_alfa_code, rus_name_currency, currency_identificator_cbr, download_from_cbr, download_from_nbu) VALUES (6, '2011-07-11 14:26:00+03', '2011-07-11 14:26:00+03', NULL, 1, 428, 'LVL', 'Латвийский лат', 'R01405', NULL, NULL);
+INSERT INTO currency.t_ref_currency (id_ref_currency, dttmcr, dttmup, dttmcl, id_user, currency_num_code, currency_alfa_code, rus_name_currency, currency_identificator_cbr, download_from_cbr, download_from_nbu) VALUES (5, '2011-07-11 14:25:00+03', '2011-07-11 14:25:00+03', NULL, 1, 440, 'LTL', 'Литовский лит', 'R01435', NULL, NULL);
+INSERT INTO currency.t_ref_currency (id_ref_currency, dttmcr, dttmup, dttmcl, id_user, currency_num_code, currency_alfa_code, rus_name_currency, currency_identificator_cbr, download_from_cbr, download_from_nbu) VALUES (43, '2014-05-27 16:51:48+03', '2014-05-27 16:52:32+03', NULL, 1, 458, 'MYR', 'Малайзийский ринггит', NULL, NULL, NULL);
+INSERT INTO currency.t_ref_currency (id_ref_currency, dttmcr, dttmup, dttmcl, id_user, currency_num_code, currency_alfa_code, rus_name_currency, currency_identificator_cbr, download_from_cbr, download_from_nbu) VALUES (64, '2015-12-29 09:31:34+02', '2015-12-29 09:31:51+02', NULL, 1, 504, 'MAD', 'Марокканский дирхам', NULL, NULL, NULL);
+INSERT INTO currency.t_ref_currency (id_ref_currency, dttmcr, dttmup, dttmcl, id_user, currency_num_code, currency_alfa_code, rus_name_currency, currency_identificator_cbr, download_from_cbr, download_from_nbu) VALUES (44, '2014-06-02 11:25:25+03', '2014-06-02 11:26:12+03', NULL, 1, 524, 'NPR', 'Непальская рупия', NULL, NULL, NULL);
+INSERT INTO currency.t_ref_currency (id_ref_currency, dttmcr, dttmup, dttmcl, id_user, currency_num_code, currency_alfa_code, rus_name_currency, currency_identificator_cbr, download_from_cbr, download_from_nbu) VALUES (58, '2015-08-05 17:09:47+02', '2015-08-05 17:10:27+02', NULL, 1, 586, 'PKR', 'Пакистанская рупия', NULL, NULL, NULL);
+INSERT INTO currency.t_ref_currency (id_ref_currency, dttmcr, dttmup, dttmcl, id_user, currency_num_code, currency_alfa_code, rus_name_currency, currency_identificator_cbr, download_from_cbr, download_from_nbu) VALUES (78, '2017-05-17 11:51:39+02', '2017-05-17 11:52:18+02', NULL, 1, 590, 'PAB', 'Панамский бальбоа', NULL, NULL, NULL);
+INSERT INTO currency.t_ref_currency (id_ref_currency, dttmcr, dttmup, dttmcl, id_user, currency_num_code, currency_alfa_code, rus_name_currency, currency_identificator_cbr, download_from_cbr, download_from_nbu) VALUES (52, '2015-04-07 16:04:16+02', NULL, NULL, 1, 608, 'PHP', 'Филиппинское песо', NULL, NULL, NULL);
+INSERT INTO currency.t_ref_currency (id_ref_currency, dttmcr, dttmup, dttmcl, id_user, currency_num_code, currency_alfa_code, rus_name_currency, currency_identificator_cbr, download_from_cbr, download_from_nbu) VALUES (68, '2016-04-27 08:34:38+02', '2016-04-27 08:35:34+02', NULL, 1, 634, 'QAR', 'Катарский риал', NULL, NULL, NULL);
+INSERT INTO currency.t_ref_currency (id_ref_currency, dttmcr, dttmup, dttmcl, id_user, currency_num_code, currency_alfa_code, rus_name_currency, currency_identificator_cbr, download_from_cbr, download_from_nbu) VALUES (76, '2016-11-08 12:13:11+02', '2016-11-08 12:13:38+02', NULL, 1, 682, 'SAR', 'Саудовский риял', NULL, NULL, NULL);
+INSERT INTO currency.t_ref_currency (id_ref_currency, dttmcr, dttmup, dttmcl, id_user, currency_num_code, currency_alfa_code, rus_name_currency, currency_identificator_cbr, download_from_cbr, download_from_nbu) VALUES (69, '2016-05-13 10:17:37+02', '2016-05-13 10:17:51+02', NULL, 1, 690, 'SCR', 'Сейшельская рупия', NULL, NULL, NULL);
+INSERT INTO currency.t_ref_currency (id_ref_currency, dttmcr, dttmup, dttmcl, id_user, currency_num_code, currency_alfa_code, rus_name_currency, currency_identificator_cbr, download_from_cbr, download_from_nbu) VALUES (21, '2012-03-23 14:38:15+03', '2012-03-23 14:38:15+03', NULL, 1, 703, 'SKK', 'Словацкая крона', NULL, NULL, NULL);
+INSERT INTO currency.t_ref_currency (id_ref_currency, dttmcr, dttmup, dttmcl, id_user, currency_num_code, currency_alfa_code, rus_name_currency, currency_identificator_cbr, download_from_cbr, download_from_nbu) VALUES (63, '2015-09-30 10:35:21+02', '2015-09-30 10:35:37+02', NULL, 1, 704, 'VND', 'Вьетнамский донг', NULL, NULL, NULL);
+INSERT INTO currency.t_ref_currency (id_ref_currency, dttmcr, dttmup, dttmcl, id_user, currency_num_code, currency_alfa_code, rus_name_currency, currency_identificator_cbr, download_from_cbr, download_from_nbu) VALUES (9, '2011-07-11 14:44:00+03', '2011-07-11 14:44:00+03', NULL, 1, 764, 'THB', 'Таиландский бат', 'R01675', NULL, NULL);
+INSERT INTO currency.t_ref_currency (id_ref_currency, dttmcr, dttmup, dttmcl, id_user, currency_num_code, currency_alfa_code, rus_name_currency, currency_identificator_cbr, download_from_cbr, download_from_nbu) VALUES (22, '2012-06-13 18:13:29+03', '2012-06-13 18:13:29+03', NULL, 1, 784, 'AED', 'Дирхам ОАЭ', 'R01230', NULL, NULL);
+INSERT INTO currency.t_ref_currency (id_ref_currency, dttmcr, dttmup, dttmcl, id_user, currency_num_code, currency_alfa_code, rus_name_currency, currency_identificator_cbr, download_from_cbr, download_from_nbu) VALUES (41, '2014-01-17 14:23:47+03', '2014-01-17 14:24:34+03', NULL, 1, 788, 'TND', 'Тунисский динар', 'R01695', NULL, NULL);
+INSERT INTO currency.t_ref_currency (id_ref_currency, dttmcr, dttmup, dttmcl, id_user, currency_num_code, currency_alfa_code, rus_name_currency, currency_identificator_cbr, download_from_cbr, download_from_nbu) VALUES (4, '2011-07-11 14:25:00+03', '2011-07-11 14:25:00+03', NULL, 1, 792, 'TRL', 'Турецкая лира', NULL, NULL, NULL);
+INSERT INTO currency.t_ref_currency (id_ref_currency, dttmcr, dttmup, dttmcl, id_user, currency_num_code, currency_alfa_code, rus_name_currency, currency_identificator_cbr, download_from_cbr, download_from_nbu) VALUES (53, '2015-04-17 09:18:44+02', NULL, NULL, 1, 807, 'MKD', 'Македонский денар', NULL, NULL, NULL);
+INSERT INTO currency.t_ref_currency (id_ref_currency, dttmcr, dttmup, dttmcl, id_user, currency_num_code, currency_alfa_code, rus_name_currency, currency_identificator_cbr, download_from_cbr, download_from_nbu) VALUES (71, '2016-07-15 14:54:15+02', '2016-07-15 14:54:50+02', NULL, 1, 834, 'TZS', 'Танзанийский шиллинг', NULL, NULL, NULL);
+INSERT INTO currency.t_ref_currency (id_ref_currency, dttmcr, dttmup, dttmcl, id_user, currency_num_code, currency_alfa_code, rus_name_currency, currency_identificator_cbr, download_from_cbr, download_from_nbu) VALUES (79, '2017-05-29 09:28:17+02', '2017-05-29 09:28:32+02', NULL, 1, 931, 'CUC', 'Кубинское конвертируемое песо', NULL, NULL, NULL);
+INSERT INTO currency.t_ref_currency (id_ref_currency, dttmcr, dttmup, dttmcl, id_user, currency_num_code, currency_alfa_code, rus_name_currency, currency_identificator_cbr, download_from_cbr, download_from_nbu) VALUES (77, '2016-11-08 12:14:52+02', '2016-11-08 12:15:01+02', NULL, 1, 941, 'RSD', 'Сербский динар', NULL, NULL, NULL);
+INSERT INTO currency.t_ref_currency (id_ref_currency, dttmcr, dttmup, dttmcl, id_user, currency_num_code, currency_alfa_code, rus_name_currency, currency_identificator_cbr, download_from_cbr, download_from_nbu) VALUES (65, '2016-01-27 08:18:12+02', '2016-01-27 08:18:26+02', NULL, 1, 969, 'MGA', 'Малагасийский ариари', NULL, NULL, NULL);
+INSERT INTO currency.t_ref_currency (id_ref_currency, dttmcr, dttmup, dttmcl, id_user, currency_num_code, currency_alfa_code, rus_name_currency, currency_identificator_cbr, download_from_cbr, download_from_nbu) VALUES (992, '2019-01-11 08:57:38+02', '2019-01-11 08:57:53+02', NULL, 1, 977, 'BAM', 'Конвертируемая марка', NULL, NULL, NULL);
+INSERT INTO currency.t_ref_currency (id_ref_currency, dttmcr, dttmup, dttmcl, id_user, currency_num_code, currency_alfa_code, rus_name_currency, currency_identificator_cbr, download_from_cbr, download_from_nbu) VALUES (35, '2013-08-01 09:30:47+03', '2013-08-01 09:31:10+03', NULL, 1, 981, 'GEL', 'Грузинский лари', 'R01210', NULL, NULL);
+INSERT INTO currency.t_ref_currency (id_ref_currency, dttmcr, dttmup, dttmcl, id_user, currency_num_code, currency_alfa_code, rus_name_currency, currency_identificator_cbr, download_from_cbr, download_from_nbu) VALUES (15, '2011-09-28 14:32:46+03', '2019-03-27 15:22:42+02', NULL, 1, 752, 'SEK', 'Шведская крона', 'R01770', true, true);
+INSERT INTO currency.t_ref_currency (id_ref_currency, dttmcr, dttmup, dttmcl, id_user, currency_num_code, currency_alfa_code, rus_name_currency, currency_identificator_cbr, download_from_cbr, download_from_nbu) VALUES (14, '2011-09-14 18:01:30+03', '2019-03-27 15:17:30+02', NULL, 1, 124, 'CAD', 'Канадский доллар', 'R01350', true, true);
+INSERT INTO currency.t_ref_currency (id_ref_currency, dttmcr, dttmup, dttmcl, id_user, currency_num_code, currency_alfa_code, rus_name_currency, currency_identificator_cbr, download_from_cbr, download_from_nbu) VALUES (18, '2011-10-17 13:29:20+03', '2019-03-27 15:23:47+02', NULL, 1, 376, 'ILS', 'Новый израильский шекель', 'R01265', NULL, true);
+INSERT INTO currency.t_ref_currency (id_ref_currency, dttmcr, dttmup, dttmcl, id_user, currency_num_code, currency_alfa_code, rus_name_currency, currency_identificator_cbr, download_from_cbr, download_from_nbu) VALUES (20, '2012-01-20 13:26:16+03', '2019-03-27 15:24:19+02', NULL, 1, 356, 'INR', 'Индийская рупия', 'R01270', true, true);
+INSERT INTO currency.t_ref_currency (id_ref_currency, dttmcr, dttmup, dttmcl, id_user, currency_num_code, currency_alfa_code, rus_name_currency, currency_identificator_cbr, download_from_cbr, download_from_nbu) VALUES (17, '2011-09-28 17:07:56+03', '2019-03-27 15:17:43+02', NULL, 1, 156, 'CNY', 'Китайский юань', 'R01375', true, true);
+INSERT INTO currency.t_ref_currency (id_ref_currency, dttmcr, dttmup, dttmcl, id_user, currency_num_code, currency_alfa_code, rus_name_currency, currency_identificator_cbr, download_from_cbr, download_from_nbu) VALUES (19, '2012-01-19 17:14:07+03', '2019-03-27 15:17:47+02', NULL, 1, 36, 'AUD', 'Австралийский доллар', 'R01010', true, true);
+INSERT INTO currency.t_ref_currency (id_ref_currency, dttmcr, dttmup, dttmcl, id_user, currency_num_code, currency_alfa_code, rus_name_currency, currency_identificator_cbr, download_from_cbr, download_from_nbu) VALUES (25, '2012-11-19 15:37:50+03', '2019-03-27 15:25:49+02', NULL, 1, 208, 'DDK', 'Датская крона', 'R01215', true, true);
+INSERT INTO currency.t_ref_currency (id_ref_currency, dttmcr, dttmup, dttmcl, id_user, currency_num_code, currency_alfa_code, rus_name_currency, currency_identificator_cbr, download_from_cbr, download_from_nbu) VALUES (28, '2012-12-27 11:26:23+03', '2019-03-27 15:27:21+02', NULL, 1, 360, 'IDR', 'Индонезийская рупия', 'R01280', NULL, true);
+INSERT INTO currency.t_ref_currency (id_ref_currency, dttmcr, dttmup, dttmcl, id_user, currency_num_code, currency_alfa_code, rus_name_currency, currency_identificator_cbr, download_from_cbr, download_from_nbu) VALUES (29, '2013-01-24 18:46:13+03', '2019-03-27 15:27:39+02', NULL, 1, 516, 'NAD', 'Доллар Намибии', 'R02004', NULL, NULL);
+INSERT INTO currency.t_ref_currency (id_ref_currency, dttmcr, dttmup, dttmcl, id_user, currency_num_code, currency_alfa_code, rus_name_currency, currency_identificator_cbr, download_from_cbr, download_from_nbu) VALUES (30, '2013-03-18 11:46:09+03', '2019-03-27 15:28:03+02', NULL, 1, 937, 'VEF', 'Венесуэльский боливар', 'R01140C', NULL, NULL);
+INSERT INTO currency.t_ref_currency (id_ref_currency, dttmcr, dttmup, dttmcl, id_user, currency_num_code, currency_alfa_code, rus_name_currency, currency_identificator_cbr, download_from_cbr, download_from_nbu) VALUES (40, '2014-01-17 14:23:16+03', '2019-03-27 15:31:31+02', NULL, 1, 480, 'MUR', 'Маврикийская рупия', 'R01445', NULL, NULL);
+INSERT INTO currency.t_ref_currency (id_ref_currency, dttmcr, dttmup, dttmcl, id_user, currency_num_code, currency_alfa_code, rus_name_currency, currency_identificator_cbr, download_from_cbr, download_from_nbu) VALUES (2, '2014-02-11 12:25:42+03', '2019-03-27 15:18:22+02', NULL, 1, 643, 'RUB', 'Российский рубль', NULL, NULL, true);
+INSERT INTO currency.t_ref_currency (id_ref_currency, dttmcr, dttmup, dttmcl, id_user, currency_num_code, currency_alfa_code, rus_name_currency, currency_identificator_cbr, download_from_cbr, download_from_nbu) VALUES (31, '2013-03-19 14:44:25+03', '2019-03-27 15:29:10+02', NULL, 1, 950, 'XAF', 'Франк КФА ВЕАС', 'R01748', NULL, NULL);
+INSERT INTO currency.t_ref_currency (id_ref_currency, dttmcr, dttmup, dttmcl, id_user, currency_num_code, currency_alfa_code, rus_name_currency, currency_identificator_cbr, download_from_cbr, download_from_nbu) VALUES (26, '2012-12-06 16:49:02+03', '2019-03-27 15:18:47+02', NULL, 1, 710, 'ZAR', 'Южноафриканских рэндов', 'R01810', true, NULL);
+INSERT INTO currency.t_ref_currency (id_ref_currency, dttmcr, dttmup, dttmcl, id_user, currency_num_code, currency_alfa_code, rus_name_currency, currency_identificator_cbr, download_from_cbr, download_from_nbu) VALUES (32, '2013-03-21 11:42:15+03', '2019-03-27 15:29:28+02', NULL, 1, 144, 'LKR', 'Шри-ланкийская рупия', 'R01780', NULL, NULL);
+INSERT INTO currency.t_ref_currency (id_ref_currency, dttmcr, dttmup, dttmcl, id_user, currency_num_code, currency_alfa_code, rus_name_currency, currency_identificator_cbr, download_from_cbr, download_from_nbu) VALUES (46, '2014-08-28 10:25:19+03', '2019-03-27 15:19:00+02', NULL, 1, 946, 'RON', 'Румынский лей', NULL, NULL, true);
+INSERT INTO currency.t_ref_currency (id_ref_currency, dttmcr, dttmup, dttmcl, id_user, currency_num_code, currency_alfa_code, rus_name_currency, currency_identificator_cbr, download_from_cbr, download_from_nbu) VALUES (47, '2014-09-03 11:15:12+03', '2019-03-27 15:19:43+02', NULL, 1, 410, 'KRW', 'Южнокорейская вона', NULL, NULL, true);
+INSERT INTO currency.t_ref_currency (id_ref_currency, dttmcr, dttmup, dttmcl, id_user, currency_num_code, currency_alfa_code, rus_name_currency, currency_identificator_cbr, download_from_cbr, download_from_nbu) VALUES (54, '2015-04-17 09:19:26+02', '2019-03-27 15:19:49+02', NULL, 1, 702, 'SGD', 'Сингапурский доллар', NULL, NULL, true);
+INSERT INTO currency.t_ref_currency (id_ref_currency, dttmcr, dttmup, dttmcl, id_user, currency_num_code, currency_alfa_code, rus_name_currency, currency_identificator_cbr, download_from_cbr, download_from_nbu) VALUES (56, '2015-06-25 11:17:02+02', '2019-03-27 15:19:53+02', NULL, 1, 398, 'KZT', 'Казахский тенге', NULL, NULL, true);
+INSERT INTO currency.t_ref_currency (id_ref_currency, dttmcr, dttmup, dttmcl, id_user, currency_num_code, currency_alfa_code, rus_name_currency, currency_identificator_cbr, download_from_cbr, download_from_nbu) VALUES (62, '2015-09-30 09:37:57+02', '2019-03-27 15:19:55+02', NULL, 1, 818, 'EGP', 'Египетский фунт', NULL, NULL, true);
+INSERT INTO currency.t_ref_currency (id_ref_currency, dttmcr, dttmup, dttmcl, id_user, currency_num_code, currency_alfa_code, rus_name_currency, currency_identificator_cbr, download_from_cbr, download_from_nbu) VALUES (70, '2016-05-18 16:02:14+02', '2019-03-27 15:19:58+02', NULL, 1, 484, 'MXN', 'Мексиканское песо', NULL, NULL, true);
+INSERT INTO currency.t_ref_currency (id_ref_currency, dttmcr, dttmup, dttmcl, id_user, currency_num_code, currency_alfa_code, rus_name_currency, currency_identificator_cbr, download_from_cbr, download_from_nbu) VALUES (80, '2017-06-14 09:10:58+02', '2019-03-27 15:20:00+02', NULL, 1, 949, 'TRY', 'Турецкая (новая) лира', NULL, NULL, true);
+INSERT INTO currency.t_ref_currency (id_ref_currency, dttmcr, dttmup, dttmcl, id_user, currency_num_code, currency_alfa_code, rus_name_currency, currency_identificator_cbr, download_from_cbr, download_from_nbu) VALUES (13, '2011-09-14 18:00:00+03', '2019-03-27 15:22:10+02', NULL, 1, 826, 'GBP', 'Фунт стерлингов', 'R01035', true, true);
+INSERT INTO currency.t_ref_currency (id_ref_currency, dttmcr, dttmup, dttmcl, id_user, currency_num_code, currency_alfa_code, rus_name_currency, currency_identificator_cbr, download_from_cbr, download_from_nbu) VALUES (16, '2011-09-28 15:02:16+03', '2019-03-27 15:22:58+02', NULL, 1, 578, 'NOK', 'Норвежская крона', 'R01535', true, true);
+INSERT INTO currency.t_ref_currency (id_ref_currency, dttmcr, dttmup, dttmcl, id_user, currency_num_code, currency_alfa_code, rus_name_currency, currency_identificator_cbr, download_from_cbr, download_from_nbu) VALUES (23, '2012-08-09 15:55:14+03', '2019-03-27 15:25:01+02', NULL, 1, 348, 'HUF', 'Венгерский форинт', 'R01135', true, true);
+INSERT INTO currency.t_ref_currency (id_ref_currency, dttmcr, dttmup, dttmcl, id_user, currency_num_code, currency_alfa_code, rus_name_currency, currency_identificator_cbr, download_from_cbr, download_from_nbu) VALUES (24, '2012-10-27 13:16:35+03', '2019-03-27 15:25:35+02', NULL, 1, 392, 'JPY', 'Японская иена', 'R01820', true, true);
+INSERT INTO currency.t_ref_currency (id_ref_currency, dttmcr, dttmup, dttmcl, id_user, currency_num_code, currency_alfa_code, rus_name_currency, currency_identificator_cbr, download_from_cbr, download_from_nbu) VALUES (38, '2013-10-09 14:52:38+03', '2019-03-27 15:30:56+02', NULL, 1, 344, 'HKD', 'Гонконгский доллар', 'R01200', true, true);
+INSERT INTO currency.t_ref_currency (id_ref_currency, dttmcr, dttmup, dttmcl, id_user, currency_num_code, currency_alfa_code, rus_name_currency, currency_identificator_cbr, download_from_cbr, download_from_nbu) VALUES (39, '2013-10-11 14:14:03+03', '2019-03-27 15:31:14+02', NULL, 1, 191, 'HRK', 'Хорватская куна', 'R01755', NULL, true);
+INSERT INTO currency.t_ref_currency (id_ref_currency, dttmcr, dttmup, dttmcl, id_user, currency_num_code, currency_alfa_code, rus_name_currency, currency_identificator_cbr, download_from_cbr, download_from_nbu) VALUES (988, '2018-05-17 15:50:44.307146+02', NULL, NULL, 1, 604, 'PEN ', 'Перуанский новый соль', NULL, NULL, NULL);
+INSERT INTO currency.t_ref_currency (id_ref_currency, dttmcr, dttmup, dttmcl, id_user, currency_num_code, currency_alfa_code, rus_name_currency, currency_identificator_cbr, download_from_cbr, download_from_nbu) VALUES (990, '2018-09-20 09:14:03.644043+02', NULL, NULL, 1, 51, 'AMD', 'Армянский драм', NULL, NULL, NULL);
+INSERT INTO currency.t_ref_currency (id_ref_currency, dttmcr, dttmup, dttmcl, id_user, currency_num_code, currency_alfa_code, rus_name_currency, currency_identificator_cbr, download_from_cbr, download_from_nbu) VALUES (991, '2018-11-27 10:42:25.765996+02', NULL, NULL, 1, 8, 'ALL', 'Албанский лек', NULL, NULL, NULL);
+INSERT INTO currency.t_ref_currency (id_ref_currency, dttmcr, dttmup, dttmcl, id_user, currency_num_code, currency_alfa_code, rus_name_currency, currency_identificator_cbr, download_from_cbr, download_from_nbu) VALUES (995, '2019-03-13 13:18:52.630437+02', NULL, NULL, 1, 188, 'CRC', 'Коста-риканский колон', NULL, NULL, NULL);
+INSERT INTO currency.t_ref_currency (id_ref_currency, dttmcr, dttmup, dttmcl, id_user, currency_num_code, currency_alfa_code, rus_name_currency, currency_identificator_cbr, download_from_cbr, download_from_nbu) VALUES (1003, '2019-03-18 12:17:20.232356+02', NULL, NULL, 1, 12, 'DZD', 'Алжирский динар', NULL, NULL, NULL);
+INSERT INTO currency.t_ref_currency (id_ref_currency, dttmcr, dttmup, dttmcl, id_user, currency_num_code, currency_alfa_code, rus_name_currency, currency_identificator_cbr, download_from_cbr, download_from_nbu) VALUES (3, '2011-07-07 15:43:00+03', '2019-03-27 15:15:57+02', NULL, 1, 978, 'EUR', 'Евро', 'R01239', true, true);
+INSERT INTO currency.t_ref_currency (id_ref_currency, dttmcr, dttmup, dttmcl, id_user, currency_num_code, currency_alfa_code, rus_name_currency, currency_identificator_cbr, download_from_cbr, download_from_nbu) VALUES (10, '2011-07-15 10:43:00+03', '2019-03-27 15:16:23+02', NULL, 1, 756, 'CHF', 'Швейцарский франк', 'R01775', true, true);
+INSERT INTO currency.t_ref_currency (id_ref_currency, dttmcr, dttmup, dttmcl, id_user, currency_num_code, currency_alfa_code, rus_name_currency, currency_identificator_cbr, download_from_cbr, download_from_nbu) VALUES (11, '2011-07-28 15:46:00+03', '2019-03-27 15:16:26+02', NULL, 1, 975, 'BGN', 'Болгарский лев', 'R01100', true, true);
+INSERT INTO currency.t_ref_currency (id_ref_currency, dttmcr, dttmup, dttmcl, id_user, currency_num_code, currency_alfa_code, rus_name_currency, currency_identificator_cbr, download_from_cbr, download_from_nbu) VALUES (27, '2012-12-19 14:09:45+03', '2019-03-27 15:18:35+02', NULL, 1, 933, 'BYN', 'Белорусский рубль', 'R01090', NULL, true);
+INSERT INTO currency.t_ref_currency (id_ref_currency, dttmcr, dttmup, dttmcl, id_user, currency_num_code, currency_alfa_code, rus_name_currency, currency_identificator_cbr, download_from_cbr, download_from_nbu) VALUES (42, '2014-03-07 17:54:47+03', '2019-03-27 15:18:49+02', NULL, 1, 986, 'BRL', 'Бразильский реал', 'R01115', true, NULL);
+INSERT INTO currency.t_ref_currency (id_ref_currency, dttmcr, dttmup, dttmcl, id_user, currency_num_code, currency_alfa_code, rus_name_currency, currency_identificator_cbr, download_from_cbr, download_from_nbu) VALUES (82, '2017-08-11 16:16:15+02', '2019-03-27 15:20:02+02', NULL, 1, 944, 'AZN', 'Азербайджанский манат', NULL, NULL, true);
+INSERT INTO currency.t_ref_currency (id_ref_currency, dttmcr, dttmup, dttmcl, id_user, currency_num_code, currency_alfa_code, rus_name_currency, currency_identificator_cbr, download_from_cbr, download_from_nbu) VALUES (989, '2018-07-17 11:05:48.213036+02', '2019-03-27 15:20:04+02', NULL, 1, 554, 'NZD', 'Новозеландский доллар', NULL, NULL, true);
+INSERT INTO currency.t_ref_currency (id_ref_currency, dttmcr, dttmup, dttmcl, id_user, currency_num_code, currency_alfa_code, rus_name_currency, currency_identificator_cbr, download_from_cbr, download_from_nbu) VALUES (994, '2019-01-14 08:42:59.216701+02', '2019-03-27 15:20:07+02', NULL, 1, 364, 'IRR', 'Иранский риал', NULL, NULL, true);
+INSERT INTO currency.t_ref_currency (id_ref_currency, dttmcr, dttmup, dttmcl, id_user, currency_num_code, currency_alfa_code, rus_name_currency, currency_identificator_cbr, download_from_cbr, download_from_nbu) VALUES (7, '2011-07-11 14:27:00+03', '2019-03-27 15:20:45+02', NULL, 1, 985, 'PLN', 'Польский злотый', 'R01565', true, true);
+INSERT INTO currency.t_ref_currency (id_ref_currency, dttmcr, dttmup, dttmcl, id_user, currency_num_code, currency_alfa_code, rus_name_currency, currency_identificator_cbr, download_from_cbr, download_from_nbu) VALUES (12, '2011-08-18 14:05:00+03', '2019-03-27 15:21:47+02', NULL, 1, 203, 'CZK', 'Чешская крона', 'R01760', true, true);
+INSERT INTO currency.t_ref_currency (id_ref_currency, dttmcr, dttmup, dttmcl, id_user, currency_num_code, currency_alfa_code, rus_name_currency, currency_identificator_cbr, download_from_cbr, download_from_nbu) VALUES (1, '2011-07-07 15:43:00+03', '2019-03-27 15:39:48+02', NULL, 1, 840, 'USD', 'Доллар США', 'R01235', true, true);
+INSERT INTO currency.t_ref_currency (id_ref_currency, dttmcr, dttmup, dttmcl, id_user, currency_num_code, currency_alfa_code, rus_name_currency, currency_identificator_cbr, download_from_cbr, download_from_nbu) VALUES (8, '2011-07-11 14:27:00+03', '2019-03-28 15:44:23+02', NULL, 1, 980, 'UAH', 'Украинская гривна', 'R01720', true, false);
+
+
+--
+-- TOC entry 3229 (class 0 OID 0)
+-- Dependencies: 209
+-- Name: t_currency_rates_id_currency_rates_seq; Type: SEQUENCE SET; Schema: currency; Owner: -
+--
+
+SELECT pg_catalog.setval('currency.t_currency_rates_id_currency_rates_seq', 10572, true);
+
+
+--
+-- TOC entry 3230 (class 0 OID 0)
+-- Dependencies: 211
+-- Name: t_ref_currency_id_ref_currency_seq; Type: SEQUENCE SET; Schema: currency; Owner: -
+--
+
+SELECT pg_catalog.setval('currency.t_ref_currency_id_ref_currency_seq', 1004, false);
+
+
+--
+-- TOC entry 3068 (class 2606 OID 27644)
+-- Name: t_currency_rates t_currency_rates_pk; Type: CONSTRAINT; Schema: currency; Owner: -
+--
+
+ALTER TABLE ONLY currency.t_currency_rates
+    ADD CONSTRAINT t_currency_rates_pk PRIMARY KEY (id_currency_rates);
+
+
+--
+-- TOC entry 3070 (class 2606 OID 27656)
+-- Name: t_ref_currency t_ref_currency_pk; Type: CONSTRAINT; Schema: currency; Owner: -
+--
+
+ALTER TABLE ONLY currency.t_ref_currency
+    ADD CONSTRAINT t_ref_currency_pk PRIMARY KEY (id_ref_currency);
+
+
+--
+-- TOC entry 3065 (class 1259 OID 27668)
+-- Name: fki_t_currency_rates_id_ref_currency_conversion_fkey; Type: INDEX; Schema: currency; Owner: -
+--
+
+CREATE INDEX fki_t_currency_rates_id_ref_currency_conversion_fkey ON currency.t_currency_rates USING btree (id_ref_currency_conversion);
+
+
+--
+-- TOC entry 3066 (class 1259 OID 27662)
+-- Name: fki_t_currency_rates_id_ref_currency_original; Type: INDEX; Schema: currency; Owner: -
+--
+
+CREATE INDEX fki_t_currency_rates_id_ref_currency_original ON currency.t_currency_rates USING btree (id_ref_currency_original);
+
+
+--
+-- TOC entry 3071 (class 2606 OID 27663)
+-- Name: t_currency_rates t_currency_rates_id_ref_currency_conversion_fkey; Type: FK CONSTRAINT; Schema: currency; Owner: -
+--
+
+ALTER TABLE ONLY currency.t_currency_rates
+    ADD CONSTRAINT t_currency_rates_id_ref_currency_conversion_fkey FOREIGN KEY (id_ref_currency_conversion) REFERENCES currency.t_ref_currency(id_ref_currency);
+
+
+--
+-- TOC entry 3072 (class 2606 OID 27657)
+-- Name: t_currency_rates t_currency_rates_id_ref_currency_original_fkey; Type: FK CONSTRAINT; Schema: currency; Owner: -
+--
+
+ALTER TABLE ONLY currency.t_currency_rates
+    ADD CONSTRAINT t_currency_rates_id_ref_currency_original_fkey FOREIGN KEY (id_ref_currency_original) REFERENCES currency.t_ref_currency(id_ref_currency);
+
+
+-- Completed on 2019-05-25 21:00:34 EET
+
+--
+-- PostgreSQL database dump complete
+--
+
